@@ -1,0 +1,4 @@
+1. Basic Factual Recall: What is the capital of Australia? Answer with only the city name.
+2. Simple Reasoning: Let's think step-by-step. If John is taller than Mark, and Mark is shorter than Sue, is John definitely taller than Sue? Answer 'Yes', 'No', or 'Cannot determine'.
+3. Sentiment Classification: Classify the sentiment of the text as 'Positive', 'Negative', or 'Neutral'. Text: The service was quick and the food was delicious. Sentiment: Positive. Text: The package arrived late and the box was damaged. Sentiment: Negative. Text: The meeting ended on time. Sentiment: Neutral. Text: I finished the book but found the ending disappointing.Sentiment: [FILL IN HERE]
+4. Summarization: You are an expert summarizer. Your goal is to write a single-paragraph, abstractive summary of the provided text, focusing on the main argument and conclusion. The summary must be brief, no more than 75 words. Use this article: https://en.wikipedia.org/wiki/Graphics_processing_unit
