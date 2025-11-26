@@ -4,6 +4,18 @@ TGI Benchmark Script
 -----------------------------
 Measures TTFT, throughput, and cost/token for a locally running Text Generation Inference (TGI) instance.
 
+USAGE
+-----------------------------
+# Single-request mode (for baseline latency and cost)
+python3 tgi_bench.py --mode single
+
+# Concurrency, latency-bound scenario
+python3 tgi_bench.py --mode concurrency --scenario latency --runs-per-prompt 5
+
+# Concurrency, throughput-bound scenario
+python3 tgi_bench.py --mode concurrency --scenario throughput --runs-per-prompt 5
+
+
 REQUIREMENTS:
 - The TGI Docker container must be running and accessible at http://localhost:8080.
   Example launch command:
@@ -21,12 +33,16 @@ REQUIREMENTS:
       pip install huggingface-hub
 """
 
-import time
+import argparse
+import asyncio
 import csv
+import json
 import statistics
+import time
 from datetime import datetime
-from huggingface_hub import InferenceClient
 
+import httpx
+from huggingface_hub import InferenceClient
 
 # Configuration
 URL = "http://localhost:8080"        # Must point to your active TGI instance
@@ -34,6 +50,7 @@ RUNS_PER_PROMPT = 5
 MAX_TOKENS = 200
 GPU_HOURLY_COST = 0.71       # USD/hour for GCP L4 (https://getdeploying.com/reference/cloud-gpu/nvidia-l4)
 WARMUP_RUNS_PER_PROMPT = 3 
+RUNS_PER_PROMPT_DEFAULT = 5
 
 # HELM-style prompts
 PROMPTS = [
@@ -79,18 +96,52 @@ PROMPTS = [
     ),
 ]
 
+# Concurrency scenarios
+SCENARIOS = {
+    "latency": {
+        # Focus on per-request latency; moderate lengths, modest concurrency
+        "description": "Latency-bound: longer generations, lower concurrency",
+        "concurrency_levels": [1, 2, 4],
+        "max_new_tokens": 256,
+    },
+    "throughput": {
+        # Focus on aggregate throughput; shorter generations, higher concurrency
+        "description": "Throughput-bound: shorter generations, higher concurrency",
+        "concurrency_levels": [1, 4, 8, 16],
+        "max_new_tokens": 64,
+    },
+}
 
+  
+def compute_cost(elapsed_sec: float, tokens: int) -> float:
+    """Compute cost/token given GPU runtime and hourly rate."""
+    if tokens <= 0:
+        return float("inf")
+    cost = (GPU_HOURLY_COST / 3600.0) * elapsed_sec
+    return cost / tokens  
 
-# Metric Functions
-def measure_ttft(client, prompt):
-    """Return Time-To-First-Token (ms)."""
+def p95(vals):
+    if not vals:
+        return float("nan")
+    if len(vals) < 2:
+        return vals[-1]
+    idx = int(0.95 * len(vals)) - 1
+    idx = max(0, min(idx, len(vals) - 1))
+    return sorted(vals)[idx]
+  
+  
+# Metric Functions Single request mode
+def measure_ttft_single(client: InferenceClient, prompt: str, max_tokens: int) -> float:
+    """
+    Return Time-To-First-Token (ms) using the streaming API via InferenceClient.
+    """
     start = time.time()
-    for _ in client.text_generation(prompt, max_new_tokens=MAX_TOKENS, stream=True):
+    for _ in client.text_generation(prompt, max_new_tokens=max_tokens, stream=True):
         return (time.time() - start) * 1000.0
-    # shouldn't reach here
     return float("nan")
-
-def measure_throughput_and_latency(client, prompt):
+  
+  
+def measure_throughput_and_latency_single(client: InferenceClient, prompt: str, max_tokens: int):
     """
     Return (tokens_generated, elapsed_time_sec) using non-streaming generation.
     """
@@ -105,34 +156,26 @@ def measure_throughput_and_latency(client, prompt):
         tokens = len(output.generated_text.split())
 
     return tokens, elapsed
-
-
-def compute_cost(elapsed_sec: float, tokens: int) -> float:
-    """
-    Compute cost/token given GPU runtime and hourly rate.
-    """
-    if tokens <= 0:
-        return float("inf")
-    cost = (GPU_HOURLY_COST / 3600.0) * elapsed_sec
-    return cost / tokens
-
-
-def main():
+  
+def run_single_mode(runs_per_prompt: int):
     client = InferenceClient(model=URL)
-    print(f"Connected to {URL}\n")
+    print(f"Connected to {URL} (single-request mode)\n")
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    outfile = f"tgi_metrics_{timestamp}.csv"
+    outfile = f"tgi_single_metrics_{timestamp}.csv"
 
-    # add warm-up 
+    max_tokens = MAX_TOKENS
+
+    # warmup
     print(f"Warmup: {WARMUP_RUNS_PER_PROMPT} runs per prompt (discarded)")
     for prompt in PROMPTS:
         for _ in range(WARMUP_RUNS_PER_PROMPT):
             try:
-                _ = measure_ttft(client, prompt)
-                _tokens, _elapsed = measure_throughput_and_latency(client, prompt)
+                _ = measure_ttft_single(client, prompt, max_tokens)
+                _tokens, _elapsed = measure_throughput_and_latency_single(
+                    client, prompt, max_tokens
+                )
             except Exception as e:
-                # don't crash on a single failure
                 print(f"  Warmup error for prompt: {e}")
     print("Warmup complete.\n")
 
@@ -151,17 +194,13 @@ def main():
         for prompt in PROMPTS:
             print(f"Prompt:\n{prompt}\n")
 
-            ttfts_ms = []
-            latencies_ms = []
-            throughputs = []
-            costs = []
+            ttfts_ms, latencies_ms, throughputs, costs = [], [], [], []
 
-            for i in range(RUNS_PER_PROMPT):
-                # TTFT
-                ttft_ms = measure_ttft(client, prompt)
-
-                # Throughput & latency
-                tokens, elapsed_sec = measure_throughput_and_latency(client, prompt)
+            for i in range(runs_per_prompt):
+                ttft_ms = measure_ttft_single(client, prompt, max_tokens)
+                tokens, elapsed_sec = measure_throughput_and_latency_single(
+                    client, prompt, max_tokens
+                )
                 latency_ms = elapsed_sec * 1000.0
                 throughput = tokens / elapsed_sec if elapsed_sec > 0 else 0.0
                 cost = compute_cost(elapsed_sec, tokens)
@@ -190,40 +229,412 @@ def main():
                     f"{cost:.8f}",
                 ])
 
-            # Summary stats per prompt
             mean_ttft = statistics.mean(ttfts_ms)
             mean_lat = statistics.mean(latencies_ms)
             mean_throughput = statistics.mean(throughputs)
             mean_cost = statistics.mean(costs)
 
-            # p50/p95 for TTFT and latency (only if enough runs)
             ttft_sorted = sorted(ttfts_ms)
             lat_sorted = sorted(latencies_ms)
             p50_ttft = ttft_sorted[len(ttft_sorted) // 2]
             p50_lat = lat_sorted[len(lat_sorted) // 2]
-
-            def p95(vals):
-                if len(vals) < 2:
-                    return vals[-1]
-                idx = int(0.95 * len(vals)) - 1
-                idx = max(0, min(idx, len(vals) - 1))
-                return sorted(vals)[idx]
-
             p95_ttft = p95(ttfts_ms)
             p95_lat = p95(latencies_ms)
 
             print(
-                f"  Mean TTFT: {mean_ttft:.2f} ms (p50={p50_ttft:.2f}, p95={p95_ttft:.2f})"
+                f"  Mean TTFT: {mean_ttft:.2f} ms "
+                f"(p50={p50_ttft:.2f}, p95={p95_ttft:.2f})"
             )
             print(
-                f"  Mean Latency: {mean_lat:.2f} ms (p50={p50_lat:.2f}, p95={p95_lat:.2f})"
+                f"  Mean Latency: {mean_lat:.2f} ms "
+                f"(p50={p50_lat:.2f}, p95={p95_lat:.2f})"
             )
             print(
                 f"  Mean Throughput: {mean_throughput:.2f} tok/s | "
                 f"Mean Cost/token: ${mean_cost:.8f}\n"
             )
 
-    print(f"Results saved to {outfile}")
+    print(f"Single-request results saved to {outfile}")
+
+
+async def measure_request_stream(
+    client: httpx.AsyncClient,
+    prompt: str,
+    max_new_tokens: int,
+) -> tuple[float, float, int]:
+    """
+    Measure a single request using /generate_stream:
+
+    Returns (ttft_ms, latency_ms, tokens_generated).
+
+    - TTFT: time from send() to first token event.
+    - Latency: time from send() to stream end ([DONE]).
+    - Tokens: count of token events.
+    """
+    url = f"{URL}/generate_stream"
+    payload = {
+        "inputs": prompt,
+        "parameters": {
+            "max_new_tokens": max_new_tokens,
+            "do_sample": False,  # deterministic for fair timing
+        },
+    }
+
+    t0 = time.perf_counter()
+    ttft_ms = None
+    tokens = 0
+
+    async with client.stream("POST", url, json=payload, timeout=None) as resp:
+        resp.raise_for_status()
+        async for line in resp.aiter_lines():
+            if not line:
+                continue
+            if not line.startswith("data:"):
+                continue
+            data = line[len("data:"):].strip()
+            if data == "[DONE]":
+                break
+            try:
+                obj = json.loads(data)
+            except json.JSONDecodeError:
+                continue
+
+            token_obj = obj.get("token")
+            if token_obj is not None:
+                tokens += 1
+                if ttft_ms is None:
+                    ttft_ms = (time.perf_counter() - t0) * 1000.0
+
+    if ttft_ms is None:
+        # No tokens produced; treat entire latency as TTFT (degenerate case)
+        ttft_ms = (time.perf_counter() - t0) * 1000.0
+
+    latency_ms = (time.perf_counter() - t0) * 1000.0
+    return ttft_ms, latency_ms, tokens
+
+
+async def run_concurrency_mode(scenario: str, runs_per_prompt: int):
+    if scenario not in SCENARIOS:
+        raise ValueError(f"Unknown scenario '{scenario}'")
+
+    cfg = SCENARIOS[scenario]
+    desc = cfg["description"]
+    concurrency_levels = cfg["concurrency_levels"]
+    max_new_tokens = cfg["max_new_tokens"]
+
+    print(f"Connected to {URL} (concurrency mode)")
+    print(f"Scenario: {scenario} — {desc}")
+    print(f"Max new tokens: {max_new_tokens}")
+    print(f"Concurrency levels: {concurrency_levels}\n")
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    outfile = f"tgi_concurrency_{scenario}_{timestamp}.csv"
+
+    async with httpx.AsyncClient(headers={"Connection": "keep-alive"}) as client:
+        # Optional warmup: one small batch per prompt
+        print("Concurrency warmup (1 batch per prompt per concurrency level, not logged)")
+        for prompt in PROMPTS:
+            for c in concurrency_levels:
+                tasks = [measure_request_stream(client, prompt, max_new_tokens)
+                         for _ in range(min(c, 2))]
+                try:
+                    await asyncio.gather(*tasks)
+                except Exception as e:
+                    print(f"  Warmup error (c={c}) for prompt: {e}")
+        print("Concurrency warmup complete.\n")
+
+        with open(outfile, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                "scenario",
+                "concurrency",
+                "prompt_idx",
+                "run",
+                "request_idx_in_batch",
+                "ttft_ms",
+                "latency_ms",
+                "tokens",
+                "throughput_tok_per_sec",
+                "cost_per_token_usd",
+            ])
+
+            # For each prompt and concurrency level, collect stats
+            for prompt_idx, prompt in enumerate(PROMPTS):
+                print(f"Prompt #{prompt_idx} (scenario={scenario}):\n{prompt}\n")
+
+                for c in concurrency_levels:
+                    print(f"  Concurrency level: {c}")
+                    all_ttft, all_lat, all_thr, all_cost = [], [], [], []
+
+                    for run_id in range(runs_per_prompt):
+                        # Launch c concurrent requests
+                        tasks = [
+                            measure_request_stream(client, prompt, max_new_tokens)
+                            for _ in range(c)
+                        ]
+                        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+                        for req_idx, res in enumerate(results):
+                            if isinstance(res, Exception):
+                                print(f"    Run {run_id+1}, req {req_idx}: ERROR {res}")
+                                continue
+
+                            ttft_ms, latency_ms, tokens = res
+                            throughput = (
+                                tokens / (latency_ms / 1000.0) if latency_ms > 0 else 0.0
+                            )
+                            cost = compute_cost(latency_ms / 1000.0, tokens)
+
+                            all_ttft.append(ttft_ms)
+                            all_lat.append(latency_ms)
+                            all_thr.append(throughput)
+                            all_cost.append(cost)
+
+                            writer.writerow([
+                                scenario,
+                                c,
+                                prompt_idx,
+                                run_id + 1,
+                                req_idx,
+                                f"{ttft_ms:.2f}",
+                                f"{latency_ms:.2f}",
+                                tokens,
+                                f"{throughput:.2f}",
+                                f"{cost:.8f}",
+                            ])
+
+                    if all_ttft:
+                        mean_ttft = statistics.mean(all_ttft)
+                        mean_lat = statistics.mean(all_lat)
+                        mean_thr = statistics.mean(all_thr)
+                        mean_cost = statistics.mean(all_cost)
+
+                        p50_ttft = sorted(all_ttft)[len(all_ttft) // 2]
+                        p50_lat = sorted(all_lat)[len(all_lat) // 2]
+                        p95_ttft = p95(all_ttft)
+                        p95_lat = p95(all_lat)
+
+                        print(
+                            f"    TTFT ms: mean={mean_ttft:.2f}, "
+                            f"p50={p50_ttft:.2f}, p95={p95_ttft:.2f}"
+                        )
+                        print(
+                            f"    Latency ms: mean={mean_lat:.2f}, "
+                            f"p50={p50_lat:.2f}, p95={p95_lat:.2f}"
+                        )
+                        print(
+                            f"    Throughput: mean={mean_thr:.2f} tok/s | "
+                            f"Mean cost/token=${mean_cost:.8f}\n"
+                        )
+                    else:
+                        print("    No successful requests for this setting.\n")
+
+    print(f"Concurrency results saved to {outfile}")
+    
+async def measure_request_stream(
+    client: httpx.AsyncClient,
+    prompt: str,
+    max_new_tokens: int,
+) -> tuple[float, float, int]:
+    """
+    Measure a single request using /generate_stream:
+
+    Returns (ttft_ms, latency_ms, tokens_generated).
+
+    - TTFT: time from send() to first token event.
+    - Latency: time from send() to stream end ([DONE]).
+    - Tokens: count of token events.
+    """
+    url = f"{URL}/generate_stream"
+    payload = {
+        "inputs": prompt,
+        "parameters": {
+            "max_new_tokens": max_new_tokens,
+            "do_sample": False,  # deterministic for fair timing
+        },
+    }
+
+    t0 = time.perf_counter()
+    ttft_ms = None
+    tokens = 0
+
+    async with client.stream("POST", url, json=payload, timeout=None) as resp:
+        resp.raise_for_status()
+        async for line in resp.aiter_lines():
+            if not line:
+                continue
+            if not line.startswith("data:"):
+                continue
+            data = line[len("data:"):].strip()
+            if data == "[DONE]":
+                break
+            try:
+                obj = json.loads(data)
+            except json.JSONDecodeError:
+                continue
+
+            token_obj = obj.get("token")
+            if token_obj is not None:
+                tokens += 1
+                if ttft_ms is None:
+                    ttft_ms = (time.perf_counter() - t0) * 1000.0
+
+    if ttft_ms is None:
+        # No tokens produced; treat entire latency as TTFT (degenerate case)
+        ttft_ms = (time.perf_counter() - t0) * 1000.0
+
+    latency_ms = (time.perf_counter() - t0) * 1000.0
+    return ttft_ms, latency_ms, tokens
+
+
+async def run_concurrency_mode(scenario: str, runs_per_prompt: int):
+    if scenario not in SCENARIOS:
+        raise ValueError(f"Unknown scenario '{scenario}'")
+
+    cfg = SCENARIOS[scenario]
+    desc = cfg["description"]
+    concurrency_levels = cfg["concurrency_levels"]
+    max_new_tokens = cfg["max_new_tokens"]
+
+    print(f"Connected to {URL} (concurrency mode)")
+    print(f"Scenario: {scenario} — {desc}")
+    print(f"Max new tokens: {max_new_tokens}")
+    print(f"Concurrency levels: {concurrency_levels}\n")
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    outfile = f"tgi_concurrency_{scenario}_{timestamp}.csv"
+
+    async with httpx.AsyncClient(headers={"Connection": "keep-alive"}) as client:
+        # Optional warmup: one small batch per prompt
+        print("Concurrency warmup (1 batch per prompt per concurrency level, not logged)")
+        for prompt in PROMPTS:
+            for c in concurrency_levels:
+                tasks = [measure_request_stream(client, prompt, max_new_tokens)
+                         for _ in range(min(c, 2))]
+                try:
+                    await asyncio.gather(*tasks)
+                except Exception as e:
+                    print(f"  Warmup error (c={c}) for prompt: {e}")
+        print("Concurrency warmup complete.\n")
+
+        with open(outfile, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                "scenario",
+                "concurrency",
+                "prompt_idx",
+                "run",
+                "request_idx_in_batch",
+                "ttft_ms",
+                "latency_ms",
+                "tokens",
+                "throughput_tok_per_sec",
+                "cost_per_token_usd",
+            ])
+
+            # For each prompt and concurrency level, collect stats
+            for prompt_idx, prompt in enumerate(PROMPTS):
+                print(f"Prompt #{prompt_idx} (scenario={scenario}):\n{prompt}\n")
+
+                for c in concurrency_levels:
+                    print(f"  Concurrency level: {c}")
+                    all_ttft, all_lat, all_thr, all_cost = [], [], [], []
+
+                    for run_id in range(runs_per_prompt):
+                        # Launch c concurrent requests
+                        tasks = [
+                            measure_request_stream(client, prompt, max_new_tokens)
+                            for _ in range(c)
+                        ]
+                        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+                        for req_idx, res in enumerate(results):
+                            if isinstance(res, Exception):
+                                print(f"    Run {run_id+1}, req {req_idx}: ERROR {res}")
+                                continue
+
+                            ttft_ms, latency_ms, tokens = res
+                            throughput = (
+                                tokens / (latency_ms / 1000.0) if latency_ms > 0 else 0.0
+                            )
+                            cost = compute_cost(latency_ms / 1000.0, tokens)
+
+                            all_ttft.append(ttft_ms)
+                            all_lat.append(latency_ms)
+                            all_thr.append(throughput)
+                            all_cost.append(cost)
+
+                            writer.writerow([
+                                scenario,
+                                c,
+                                prompt_idx,
+                                run_id + 1,
+                                req_idx,
+                                f"{ttft_ms:.2f}",
+                                f"{latency_ms:.2f}",
+                                tokens,
+                                f"{throughput:.2f}",
+                                f"{cost:.8f}",
+                            ])
+
+                    if all_ttft:
+                        mean_ttft = statistics.mean(all_ttft)
+                        mean_lat = statistics.mean(all_lat)
+                        mean_thr = statistics.mean(all_thr)
+                        mean_cost = statistics.mean(all_cost)
+
+                        p50_ttft = sorted(all_ttft)[len(all_ttft) // 2]
+                        p50_lat = sorted(all_lat)[len(all_lat) // 2]
+                        p95_ttft = p95(all_ttft)
+                        p95_lat = p95(all_lat)
+
+                        print(
+                            f"    TTFT ms: mean={mean_ttft:.2f}, "
+                            f"p50={p50_ttft:.2f}, p95={p95_ttft:.2f}"
+                        )
+                        print(
+                            f"    Latency ms: mean={mean_lat:.2f}, "
+                            f"p50={p50_lat:.2f}, p95={p95_lat:.2f}"
+                        )
+                        print(
+                            f"    Throughput: mean={mean_thr:.2f} tok/s | "
+                            f"Mean cost/token=${mean_cost:.8f}\n"
+                        )
+                    else:
+                        print("    No successful requests for this setting.\n")
+
+    print(f"Concurrency results saved to {outfile}")    
+
+def parse_args():
+    ap = argparse.ArgumentParser()
+    ap.add_argument(
+        "--mode",
+        choices=["single", "concurrency"],
+        default="single",
+        help="Benchmark mode: 'single' (per-request) or 'concurrency' (multiple parallel requests).",
+    )
+    ap.add_argument(
+        "--scenario",
+        choices=list(SCENARIOS.keys()),
+        default="latency",
+        help="Concurrency scenario: 'latency' or 'throughput' (only used in concurrency mode).",
+    )
+    ap.add_argument(
+        "--runs-per-prompt",
+        type=int,
+        default=RUNS_PER_PROMPT_DEFAULT,
+        help="Number of measured runs per prompt (per concurrency level in concurrency mode).",
+    )
+    return ap.parse_args()
+
+
+def main():
+    args = parse_args()
+
+    if args.mode == "single":
+        run_single_mode(args.runs_per_prompt)
+    else:
+        asyncio.run(run_concurrency_mode(args.scenario, args.runs_per_prompt))
 
 
 if __name__ == "__main__":
