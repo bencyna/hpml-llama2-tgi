@@ -43,8 +43,9 @@ PROMPTS = [
 def measure_ttft(client, prompt):
     """Return Time-To-First-Token (ms)."""
     start = time.time()
-    for _ in client.text_generation(prompt, max_new_tokens=MAX_TOKENS, stream=True):
-        return (time.time() - start) * 1000
+    for chunk in client.text_generation(..., stream=True):
+      if hasattr(chunk, "token") and chunk.token is not None:
+          return (time.time() - start) * 1000
 
 
 def measure_throughput(client, prompt):
