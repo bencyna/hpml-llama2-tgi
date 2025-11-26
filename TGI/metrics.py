@@ -138,28 +138,90 @@ def main():
 
     with open(outfile, "w", newline="") as f:
         writer = csv.writer(f)
-        writer.writerow(["prompt", "run", "ttft_ms", "throughput_tps", "cost_per_token_usd"])
+        writer.writerow([
+            "prompt",
+            "run",
+            "ttft_ms",
+            "latency_ms",
+            "tokens",
+            "throughput_tok_per_sec",
+            "cost_per_token_usd",
+        ])
 
         for prompt in PROMPTS:
-            print(f"Prompt: {prompt}")
-            ttfts, throughputs, costs = [], [], []
+            print(f"Prompt:\n{prompt}\n")
+
+            ttfts_ms = []
+            latencies_ms = []
+            throughputs = []
+            costs = []
 
             for i in range(RUNS_PER_PROMPT):
-                ttft = measure_ttft(client, prompt)
-                tokens, elapsed = measure_throughput(client, prompt)
-                throughput = tokens / elapsed
-                cost = compute_cost(elapsed, tokens)
+                # TTFT
+                ttft_ms = measure_ttft(client, prompt)
 
-                ttfts.append(ttft)
+                # Throughput & latency
+                tokens, elapsed_sec = measure_throughput_and_latency(client, prompt)
+                latency_ms = elapsed_sec * 1000.0
+                throughput = tokens / elapsed_sec if elapsed_sec > 0 else 0.0
+                cost = compute_cost(elapsed_sec, tokens)
+
+                ttfts_ms.append(ttft_ms)
+                latencies_ms.append(latency_ms)
                 throughputs.append(throughput)
                 costs.append(cost)
 
-                print(f"  Run {i+1}: TTFT={ttft:.2f} ms | Throughput={throughput:.2f} tok/s | Cost/token=${cost:.8f}")
-                writer.writerow([prompt, i + 1, f"{ttft:.2f}", f"{throughput:.2f}", f"{cost:.8f}"])
+                print(
+                    f"  Run {i+1}: "
+                    f"TTFT={ttft_ms:.2f} ms | "
+                    f"Latency={latency_ms:.2f} ms | "
+                    f"Tokens={tokens} | "
+                    f"Throughput={throughput:.2f} tok/s | "
+                    f"Cost/token=${cost:.8f}"
+                )
 
-            print(f"  Mean TTFT: {statistics.mean(ttfts):.2f} ms")
-            print(f"  Mean Throughput: {statistics.mean(throughputs):.2f} tok/s")
-            print(f"  Mean Cost/token: ${statistics.mean(costs):.8f}\n")
+                writer.writerow([
+                    prompt.replace("\n", "\\n"),
+                    i + 1,
+                    f"{ttft_ms:.2f}",
+                    f"{latency_ms:.2f}",
+                    tokens,
+                    f"{throughput:.2f}",
+                    f"{cost:.8f}",
+                ])
+
+            # Summary stats per prompt
+            mean_ttft = statistics.mean(ttfts_ms)
+            mean_lat = statistics.mean(latencies_ms)
+            mean_throughput = statistics.mean(throughputs)
+            mean_cost = statistics.mean(costs)
+
+            # p50/p95 for TTFT and latency (only if enough runs)
+            ttft_sorted = sorted(ttfts_ms)
+            lat_sorted = sorted(latencies_ms)
+            p50_ttft = ttft_sorted[len(ttft_sorted) // 2]
+            p50_lat = lat_sorted[len(lat_sorted) // 2]
+
+            def p95(vals):
+                if len(vals) < 2:
+                    return vals[-1]
+                idx = int(0.95 * len(vals)) - 1
+                idx = max(0, min(idx, len(vals) - 1))
+                return sorted(vals)[idx]
+
+            p95_ttft = p95(ttfts_ms)
+            p95_lat = p95(latencies_ms)
+
+            print(
+                f"  Mean TTFT: {mean_ttft:.2f} ms (p50={p50_ttft:.2f}, p95={p95_ttft:.2f})"
+            )
+            print(
+                f"  Mean Latency: {mean_lat:.2f} ms (p50={p50_lat:.2f}, p95={p95_lat:.2f})"
+            )
+            print(
+                f"  Mean Throughput: {mean_throughput:.2f} tok/s | "
+                f"Mean Cost/token: ${mean_cost:.8f}\n"
+            )
 
     print(f"Results saved to {outfile}")
 
