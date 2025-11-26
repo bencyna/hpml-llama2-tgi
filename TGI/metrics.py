@@ -276,7 +276,7 @@ async def measure_request_stream(
         "inputs": prompt,
         "parameters": {
             "max_new_tokens": max_new_tokens,
-            "do_sample": False,  # deterministic for fair timing
+            "do_sample": False, 
         },
     }
 
