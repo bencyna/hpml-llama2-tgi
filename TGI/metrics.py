@@ -33,6 +33,7 @@ URL = "http://localhost:8080"        # Must point to your active TGI instance
 RUNS_PER_PROMPT = 5
 MAX_TOKENS = 200
 GPU_HOURLY_COST = 0.71       # USD/hour for GCP L4 (https://getdeploying.com/reference/cloud-gpu/nvidia-l4)
+WARMUP_RUNS_PER_PROMPT = 3 
 
 # HELM-style prompts
 PROMPTS = [
@@ -89,7 +90,7 @@ def measure_ttft(client, prompt):
     # shouldn't reach here
     return float("nan")
 
-def measure_throughput(client, prompt):
+def measure_throughput_and_latency(client, prompt):
     """
     Return (tokens_generated, elapsed_time_sec) using non-streaming generation.
     """
@@ -106,9 +107,13 @@ def measure_throughput(client, prompt):
     return tokens, elapsed
 
 
-def compute_cost(elapsed_sec, tokens):
-    """Compute cost/token given GPU runtime."""
-    cost = (GPU_HOURLY_COST / 3600) * elapsed_sec
+def compute_cost(elapsed_sec: float, tokens: int) -> float:
+    """
+    Compute cost/token given GPU runtime and hourly rate.
+    """
+    if tokens <= 0:
+        return float("inf")
+    cost = (GPU_HOURLY_COST / 3600.0) * elapsed_sec
     return cost / tokens
 
 
@@ -119,7 +124,17 @@ def main():
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     outfile = f"tgi_metrics_{timestamp}.csv"
 
-    # TODO: add warm-up run?
+    # add warm-up 
+    print(f"Warmup: {WARMUP_RUNS_PER_PROMPT} runs per prompt (discarded)")
+    for prompt in PROMPTS:
+        for _ in range(WARMUP_RUNS_PER_PROMPT):
+            try:
+                _ = measure_ttft(client, prompt)
+                _tokens, _elapsed = measure_throughput_and_latency(client, prompt)
+            except Exception as e:
+                # don't crash on a single failure
+                print(f"  Warmup error for prompt: {e}")
+    print("Warmup complete.\n")
 
     with open(outfile, "w", newline="") as f:
         writer = csv.writer(f)
