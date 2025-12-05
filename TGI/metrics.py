@@ -40,6 +40,7 @@ import asyncio
 import csv
 import json
 import os
+import re
 import statistics
 import time
 from datetime import datetime
@@ -58,50 +59,30 @@ RUNS_PER_PROMPT_DEFAULT = 5
 MODEL_NAME = "meta-llama/Llama-2-7b-chat-hf"
 # Prefix caching: caches KV computations across requests for shared prompt prefixes
 PREFIX_CACHING = True        # Set to False when running with --disable-prefix-caching
+PROMPTS_FILE = "../prompts.txt"
 
-# HELM-style prompts
-PROMPTS = [
-    # Basic factual recall
-    "Basic Factual Recall: What is the capital of Australia? Answer with only the city name.",
 
-    # Simple reasoning
-    (
-        "Simple Reasoning:\n"
-        "Let's think step-by-step. If John is taller than Mark, and Mark is shorter than Sue, "
-        "is John definitely taller than Sue? Answer 'Yes', 'No', or 'Cannot determine'."
-    ),
+def load_prompts(filepath):
+    """Load prompts from a text file, stripping leading numbers like '1. '"""
+    prompts = []
+    try:
+        with open(filepath, 'r') as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    cleaned = re.sub(r'^\d+\.\s*', '', line)
+                    prompts.append(cleaned)
+    except FileNotFoundError:
+        raise FileNotFoundError(f"Prompts file not found: {filepath}")
+    if not prompts:
+        raise ValueError(f"No prompts found in {filepath}")
+    return prompts
 
-    # Sentiment classification
-    (
-        "Sentiment Classification:\n"
-        "Classify the sentiment of the text as 'Positive', 'Negative', or 'Neutral'. "
-        "Text: The service was quick and the food was delicious. Sentiment: Positive. "
-        "Text: The package arrived late and the box was damaged. Sentiment: Negative. "
-        "Text: The meeting ended on time. Sentiment: Neutral. "
-        "Text: I finished the book but found the ending disappointing. Sentiment: [FILL IN HERE]"
-    ),
 
-    # Summarization (GPU article)
-    (
-        "Summarization:\n"
-        "You are an expert summarizer. Your goal is to write a single-paragraph, abstractive "
-        "summary of the provided text, focusing on the main argument and conclusion. The summary "
-        "must be brief, no more than 75 words. Use this article: https://en.wikipedia.org/wiki/Graphics_processing_unit"
-    ),
-
-    # ~100-token technical brief
-    (
-        "You are an analyst summarizing the reliability challenges of machine learning systems "
-        "deployed in production. Write a concise technical brief that covers the following points:\n"
-        "1. Why data drift and concept drift can silently degrade model accuracy over time.\n"
-        "2. The difference between offline evaluation metrics and online performance monitoring.\n"
-        "3. How organizations typically detect and respond to such degradations, including examples "
-        "of monitoring signals or retraining strategies.\n"
-        "4. End with a two-sentence recommendation for maintaining model robustness under changing "
-        "data distributions.\n"
-        "Keep the tone professional and information-dense, as if writing for a senior engineering audience."
-    ),
-]
+try:
+    PROMPTS = load_prompts(PROMPTS_FILE)
+except (FileNotFoundError, ValueError) as e:
+    raise SystemExit(f"Error loading prompts: {e}")
 
 # Concurrency scenarios
 SCENARIOS = {
