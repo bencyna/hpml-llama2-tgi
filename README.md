@@ -1,4 +1,3 @@
 # HPML Project - LLama2 - TGI
 
-Note for TGI kv cache measurement:
-Unlike vLLM which dynamically manages memory blocks (and exposes cache utilization metrics), TGI allocates memory upfront for its KV cache and doesn't show dynamic fluctuations via nvidia-smi. So, at the moment, because TGI pre-allocates memory, our kv cache test shows constant GPU usage throughout the test, which isn't too informative.
+**Note on TGI KV cache measurement:** vLLM uses PagedAttention with dynamic memory management and exposes real-time KV cache utilization via its `/metrics` endpoint (e.g., `vllm:gpu_cache_usage_perc`). TGI, on the other hand, pre-allocates GPU memory for the KV cache at startup, so nvidia-smi shows constant memory usage throughout inference (~88% in our tests). The TGI metrics endpoint (port 9000) doesn't expose KV cache utilization metrics, and memory fluctuations are minimal and within nvidia-smi's MB-level granularity. As a result, our `kv_cache.py` timeline numbers appears constant.

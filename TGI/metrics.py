@@ -57,8 +57,7 @@ GPU_HOURLY_COST = 0.71       # USD/hour for GCP L4 (https://getdeploying.com/ref
 WARMUP_RUNS_PER_PROMPT = 3
 RUNS_PER_PROMPT_DEFAULT = 5
 MODEL_NAME = "meta-llama/Llama-2-7b-chat-hf"
-# Prefix caching: caches KV computations across requests for shared prompt prefixes
-PREFIX_CACHING = True        # Set to False when running with --disable-prefix-caching
+PREFIX_CACHING = True        # Caches KV computations across requests for shared prompt prefixes
 PROMPTS_FILE = "../prompts.txt"
 
 
@@ -81,7 +80,7 @@ def load_prompts(filepath):
 
 try:
     PROMPTS = load_prompts(PROMPTS_FILE)
-except (FileNotFoundError, ValueError) as e:
+except Exception as e:
     raise SystemExit(f"Error loading prompts: {e}")
 
 # Concurrency scenarios
