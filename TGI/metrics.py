@@ -30,18 +30,22 @@ REQUIREMENTS:
       python3 -m venv venv
       source venv/bin/activate
       pip install --upgrade pip
-      pip install huggingface-hub
+      pip install huggingface-hub wandb
+
+- Set environment variable W_AND_B_API_KEY with your Weights & Biases API key.
 """
 
 import argparse
 import asyncio
 import csv
 import json
+import os
 import statistics
 import time
 from datetime import datetime
 
 import httpx
+import wandb
 from huggingface_hub import InferenceClient
 
 # Configuration
@@ -49,8 +53,11 @@ URL = "http://localhost:8080"        # Must point to your active TGI instance
 RUNS_PER_PROMPT = 5
 MAX_TOKENS = 200
 GPU_HOURLY_COST = 0.71       # USD/hour for GCP L4 (https://getdeploying.com/reference/cloud-gpu/nvidia-l4)
-WARMUP_RUNS_PER_PROMPT = 3 
+WARMUP_RUNS_PER_PROMPT = 3
 RUNS_PER_PROMPT_DEFAULT = 5
+MODEL_NAME = "meta-llama/Llama-2-7b-chat-hf"
+# Prefix caching: caches KV computations across requests for shared prompt prefixes
+PREFIX_CACHING = True        # Set to False when running with --disable-prefix-caching
 
 # HELM-style prompts
 PROMPTS = [
@@ -157,7 +164,27 @@ def measure_throughput_and_latency_single(client: InferenceClient, prompt: str, 
 
     return tokens, elapsed
   
+def init_wandb(mode: str, scenario: str = None):
+    """Initialize Weights & Biases logging."""
+    wandb.login(key=os.environ.get("W_AND_B_API_KEY"))
+    run_name = f"tgi-{mode}" if scenario is None else f"tgi-{mode}-{scenario}"
+    wandb.init(project="hpml-tgi-benchmark", name=run_name)
+    wandb.config.update({
+        "model_name": MODEL_NAME,
+        "dtype": "float16",
+        "num_shard": 1,
+        "max_tokens": MAX_TOKENS,
+        "runs_per_prompt": RUNS_PER_PROMPT_DEFAULT,
+        "gpu_type": "L4",
+        "gpu_hourly_cost": GPU_HOURLY_COST,
+        "prefix_caching": PREFIX_CACHING,
+        "mode": mode,
+        "scenario": scenario
+    })
+
+
 def run_single_mode(runs_per_prompt: int):
+    init_wandb("single")
     client = InferenceClient(model=URL)
     print(f"Connected to {URL} (single-request mode)\n")
 
@@ -219,6 +246,15 @@ def run_single_mode(runs_per_prompt: int):
                     f"Cost/token=${cost:.8f}"
                 )
 
+                # Log to W&B
+                wandb.log({
+                    "ttft_ms": ttft_ms,
+                    "latency_ms": latency_ms,
+                    "tokens": tokens,
+                    "throughput_tps": throughput,
+                    "cost_per_token_usd": cost
+                })
+
                 writer.writerow([
                     prompt.replace("\n", "\\n"),
                     i + 1,
@@ -255,6 +291,7 @@ def run_single_mode(runs_per_prompt: int):
             )
 
     print(f"Single-request results saved to {outfile}")
+    wandb.finish()
 
 
 async def measure_request_stream(
@@ -314,6 +351,7 @@ async def measure_request_stream(
 
 
 async def run_concurrency_mode(scenario: str, runs_per_prompt: int):
+    init_wandb("concurrency", scenario)
     if scenario not in SCENARIOS:
         raise ValueError(f"Unknown scenario '{scenario}'")
 
@@ -389,6 +427,16 @@ async def run_concurrency_mode(scenario: str, runs_per_prompt: int):
                             all_lat.append(latency_ms)
                             all_thr.append(throughput)
                             all_cost.append(cost)
+
+                            # Log to W&B
+                            wandb.log({
+                                "concurrency": c,
+                                "ttft_ms": ttft_ms,
+                                "latency_ms": latency_ms,
+                                "tokens": tokens,
+                                "throughput_tps": throughput,
+                                "cost_per_token_usd": cost
+                            })
 
                             writer.writerow([
                                 scenario,
@@ -430,180 +478,8 @@ async def run_concurrency_mode(scenario: str, runs_per_prompt: int):
                         print("    No successful requests for this setting.\n")
 
     print(f"Concurrency results saved to {outfile}")
-    
-async def measure_request_stream(
-    client: httpx.AsyncClient,
-    prompt: str,
-    max_new_tokens: int,
-) -> tuple[float, float, int]:
-    """
-    Measure a single request using /generate_stream:
+    wandb.finish()
 
-    Returns (ttft_ms, latency_ms, tokens_generated).
-
-    - TTFT: time from send() to first token event.
-    - Latency: time from send() to stream end ([DONE]).
-    - Tokens: count of token events.
-    """
-    url = f"{URL}/generate_stream"
-    payload = {
-        "inputs": prompt,
-        "parameters": {
-            "max_new_tokens": max_new_tokens,
-            "do_sample": False,  
-        },
-    }
-
-    t0 = time.perf_counter()
-    ttft_ms = None
-    tokens = 0
-
-    async with client.stream("POST", url, json=payload, timeout=None) as resp:
-        resp.raise_for_status()
-        async for line in resp.aiter_lines():
-            if not line:
-                continue
-            if not line.startswith("data:"):
-                continue
-            data = line[len("data:"):].strip()
-            if data == "[DONE]":
-                break
-            try:
-                obj = json.loads(data)
-            except json.JSONDecodeError:
-                continue
-
-            token_obj = obj.get("token")
-            if token_obj is not None:
-                tokens += 1
-                if ttft_ms is None:
-                    ttft_ms = (time.perf_counter() - t0) * 1000.0
-
-    if ttft_ms is None:
-        # No tokens produced; treat entire latency as TTFT (degenerate case)
-        ttft_ms = (time.perf_counter() - t0) * 1000.0
-
-    latency_ms = (time.perf_counter() - t0) * 1000.0
-    return ttft_ms, latency_ms, tokens
-
-
-async def run_concurrency_mode(scenario: str, runs_per_prompt: int):
-    if scenario not in SCENARIOS:
-        raise ValueError(f"Unknown scenario '{scenario}'")
-
-    cfg = SCENARIOS[scenario]
-    desc = cfg["description"]
-    concurrency_levels = cfg["concurrency_levels"]
-    max_new_tokens = cfg["max_new_tokens"]
-
-    print(f"Connected to {URL} (concurrency mode)")
-    print(f"Scenario: {scenario} — {desc}")
-    print(f"Max new tokens: {max_new_tokens}")
-    print(f"Concurrency levels: {concurrency_levels}\n")
-
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    outfile = f"tgi_concurrency_{scenario}_{timestamp}.csv"
-
-    async with httpx.AsyncClient(headers={"Connection": "keep-alive"}) as client:
-        # Optional warmup: one small batch per prompt
-        print("Concurrency warmup (1 batch per prompt per concurrency level, not logged)")
-        for prompt in PROMPTS:
-            for c in concurrency_levels:
-                tasks = [measure_request_stream(client, prompt, max_new_tokens)
-                         for _ in range(min(c, 2))]
-                try:
-                    await asyncio.gather(*tasks)
-                except Exception as e:
-                    print(f"  Warmup error (c={c}) for prompt: {e}")
-        print("Concurrency warmup complete.\n")
-
-        with open(outfile, "w", newline="") as f:
-            writer = csv.writer(f)
-            writer.writerow([
-                "scenario",
-                "concurrency",
-                "prompt_idx",
-                "run",
-                "request_idx_in_batch",
-                "ttft_ms",
-                "latency_ms",
-                "tokens",
-                "throughput_tok_per_sec",
-                "cost_per_token_usd",
-            ])
-
-            # For each prompt and concurrency level, collect stats
-            for prompt_idx, prompt in enumerate(PROMPTS):
-                print(f"Prompt #{prompt_idx} (scenario={scenario}):\n{prompt}\n")
-
-                for c in concurrency_levels:
-                    print(f"  Concurrency level: {c}")
-                    all_ttft, all_lat, all_thr, all_cost = [], [], [], []
-
-                    for run_id in range(runs_per_prompt):
-                        # Launch c concurrent requests
-                        tasks = [
-                            measure_request_stream(client, prompt, max_new_tokens)
-                            for _ in range(c)
-                        ]
-                        results = await asyncio.gather(*tasks, return_exceptions=True)
-
-                        for req_idx, res in enumerate(results):
-                            if isinstance(res, Exception):
-                                print(f"    Run {run_id+1}, req {req_idx}: ERROR {res}")
-                                continue
-
-                            ttft_ms, latency_ms, tokens = res
-                            throughput = (
-                                tokens / (latency_ms / 1000.0) if latency_ms > 0 else 0.0
-                            )
-                            cost = compute_cost(latency_ms / 1000.0, tokens)
-
-                            all_ttft.append(ttft_ms)
-                            all_lat.append(latency_ms)
-                            all_thr.append(throughput)
-                            all_cost.append(cost)
-
-                            writer.writerow([
-                                scenario,
-                                c,
-                                prompt_idx,
-                                run_id + 1,
-                                req_idx,
-                                f"{ttft_ms:.2f}",
-                                f"{latency_ms:.2f}",
-                                tokens,
-                                f"{throughput:.2f}",
-                                f"{cost:.8f}",
-                            ])
-
-                    if all_ttft:
-                        mean_ttft = statistics.mean(all_ttft)
-                        mean_lat = statistics.mean(all_lat)
-                        mean_thr = statistics.mean(all_thr)
-                        mean_cost = statistics.mean(all_cost)
-
-                        p50_ttft = sorted(all_ttft)[len(all_ttft) // 2]
-                        p50_lat = sorted(all_lat)[len(all_lat) // 2]
-                        p95_ttft = p95(all_ttft)
-                        p95_lat = p95(all_lat)
-
-                        print(
-                            f"    TTFT ms: mean={mean_ttft:.2f}, "
-                            f"p50={p50_ttft:.2f}, p95={p95_ttft:.2f}"
-                        )
-                        print(
-                            f"    Latency ms: mean={mean_lat:.2f}, "
-                            f"p50={p50_lat:.2f}, p95={p95_lat:.2f}"
-                        )
-                        print(
-                            f"    Throughput: mean={mean_thr:.2f} tok/s | "
-                            f"Mean cost/token=${mean_cost:.8f}\n"
-                        )
-                    else:
-                        print("    No successful requests for this setting.\n")
-
-    print(f"Concurrency results saved to {outfile}")    
 
 def parse_args():
     ap = argparse.ArgumentParser()
