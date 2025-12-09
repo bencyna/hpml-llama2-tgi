@@ -94,7 +94,7 @@ SCENARIOS = {
     "throughput": {
         # Focus on aggregate throughput; shorter generations, higher concurrency
         "description": "Throughput-bound: shorter generations, higher concurrency",
-        "concurrency_levels": [1, 4, 8, 16],
+        "concurrency_levels": [1, 4, 8, 16, 32, 64, 128],
         "max_new_tokens": 64,
     },
 }
@@ -372,7 +372,8 @@ async def run_concurrency_mode(scenario: str, runs_per_prompt: int):
                 "ttft_ms",
                 "latency_ms",
                 "tokens",
-                "throughput_tok_per_sec",
+                "per_request_throughput_tok_per_sec",
+                "aggregate_throughput_tok_per_sec",
                 "cost_per_token_usd",
             ])
 
@@ -385,27 +386,40 @@ async def run_concurrency_mode(scenario: str, runs_per_prompt: int):
                     all_ttft, all_lat, all_thr, all_cost = [], [], [], []
 
                     for run_id in range(runs_per_prompt):
-                        # Launch c concurrent requests
+                        # Launch c concurrent requests and measure batch completion time
                         tasks = [
                             measure_request_stream(client, prompt, max_new_tokens)
                             for _ in range(c)
                         ]
+                        batch_start = time.perf_counter()
                         results = await asyncio.gather(*tasks, return_exceptions=True)
+                        batch_duration_sec = time.perf_counter() - batch_start
 
+                        # Calculate aggregate throughput for the batch
+                        batch_total_tokens = 0
+                        batch_results = []
                         for req_idx, res in enumerate(results):
                             if isinstance(res, Exception):
                                 print(f"    Run {run_id+1}, req {req_idx}: ERROR {res}")
                                 continue
-
                             ttft_ms, latency_ms, tokens = res
-                            throughput = (
+                            batch_total_tokens += tokens
+                            batch_results.append((req_idx, ttft_ms, latency_ms, tokens))
+
+                        # Aggregate throughput: total tokens from all requests / batch completion time
+                        aggregate_throughput = (
+                            batch_total_tokens / batch_duration_sec if batch_duration_sec > 0 else 0.0
+                        )
+
+                        for req_idx, ttft_ms, latency_ms, tokens in batch_results:
+                            per_request_throughput = (
                                 tokens / (latency_ms / 1000.0) if latency_ms > 0 else 0.0
                             )
                             cost = compute_cost(latency_ms / 1000.0, tokens)
 
                             all_ttft.append(ttft_ms)
                             all_lat.append(latency_ms)
-                            all_thr.append(throughput)
+                            all_thr.append(aggregate_throughput)
                             all_cost.append(cost)
 
                             # Log to W&B
@@ -414,7 +428,10 @@ async def run_concurrency_mode(scenario: str, runs_per_prompt: int):
                                 "ttft_ms": ttft_ms,
                                 "latency_ms": latency_ms,
                                 "tokens": tokens,
-                                "throughput_tps": throughput,
+                                "per_request_throughput_tps": per_request_throughput,
+                                "aggregate_throughput_tps": aggregate_throughput,
+                                "batch_total_tokens": batch_total_tokens,
+                                "batch_duration_sec": batch_duration_sec,
                                 "cost_per_token_usd": cost
                             })
 
@@ -427,14 +444,15 @@ async def run_concurrency_mode(scenario: str, runs_per_prompt: int):
                                 f"{ttft_ms:.2f}",
                                 f"{latency_ms:.2f}",
                                 tokens,
-                                f"{throughput:.2f}",
+                                f"{per_request_throughput:.2f}",
+                                f"{aggregate_throughput:.2f}",
                                 f"{cost:.8f}",
                             ])
 
                     if all_ttft:
                         mean_ttft = statistics.mean(all_ttft)
                         mean_lat = statistics.mean(all_lat)
-                        mean_thr = statistics.mean(all_thr)
+                        mean_agg_thr = statistics.mean(all_thr)
                         mean_cost = statistics.mean(all_cost)
 
                         p50_ttft = sorted(all_ttft)[len(all_ttft) // 2]
@@ -451,7 +469,7 @@ async def run_concurrency_mode(scenario: str, runs_per_prompt: int):
                             f"p50={p50_lat:.2f}, p95={p95_lat:.2f}"
                         )
                         print(
-                            f"    Throughput: mean={mean_thr:.2f} tok/s | "
+                            f"    Aggregate Throughput: mean={mean_agg_thr:.2f} tok/s | "
                             f"Mean cost/token=${mean_cost:.8f}\n"
                         )
                     else:
