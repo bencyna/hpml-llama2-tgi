@@ -74,6 +74,7 @@ Outputs:
 * Memory time series: results/kv_cache_study/gpu_memory_data.json
 * Memory utilization plot: results/kv_cache_study/gpu_memory_timeline.png
 
+---
 
 ## Naive HuggingFace Baseline
 
