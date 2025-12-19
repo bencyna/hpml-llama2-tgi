@@ -225,7 +225,7 @@ cat <OUTPUT_DIR>/<timestamp>/summary.csv
 
 ---
 
-## 5. Implementation Notes
+## 5. Notes
 
 - All experiments use FP16 precision with KV caching enabled
 - Prompts used for evaluation are included in `prompts.txt`
@@ -233,6 +233,8 @@ cat <OUTPUT_DIR>/<timestamp>/summary.csv
 - vLLM exposes KV-cache utilization directly via its `/metrics` endpoint
 - TGI pre-allocates KV-cache memory at startup; utilization is inferred indirectly via `nvidia-smi`
 - Baseline exhausts GPU memory at lower batch sizes for complex tasks (Sentiment maxes at 32, Summary at 16)
+
+Blog Post: https://medium.com/@am5994/decomposing-llm-inference-optimizations-a-comparative-performance-study-of-vllm-tgi-and-naive-2fb20a0f5568?postPublishedType=initial
 
 ---
 
