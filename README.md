@@ -21,7 +21,7 @@ Metrics measured:
 
 ### Python
 ```bash
-pip install torch transformers requests pandas numpy matplotlib huggingface-hub wandb vllm
+pip install torch transformers requests pandas numpy matplotlib huggingface-hub wandb vllm einops
 ```
 
 Ensure `HF_TOKEN` is set for gated model access:
@@ -29,6 +29,8 @@ Ensure `HF_TOKEN` is set for gated model access:
 export HF_TOKEN=<your_huggingface_token>
 ```
 
+### Baseline Model
+To run the baseline model and tests, the Jupyter Notebook cells should be run in order. 
 
 ## Text Generation Inference (TGI)
 
